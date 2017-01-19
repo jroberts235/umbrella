@@ -1,0 +1,8 @@
+name: "umbrella"
+version: "0.1.0"
+usage: "Breakout umbrella chart into individual releases"
+description: |-
+  Breakout umbrella chart into individual releases
+ignoreFlags: false
+useTunnel: false
+command: "$HELM_PLUGIN_DIR/helmPlus"
