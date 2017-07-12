@@ -1,0 +1,277 @@
+#! /usr/bin/env ruby
+version = '1.0.0'
+#
+# A script to deploy umbrella Helm charts as individual deployments
+#
+# Read the requirements.yaml and parse chart names, repository and version
+# Iterate over the list and call the helm binary to do the deployment.
+# Parse the values.yaml file and create individual overrides files for each chart
+# that contains not only the values for that chart, but also global values from
+# parent chart. Apply the overrides at install time with `helm install -f`
+#
+
+require 'yaml'
+require 'mixlib/cli'
+require 'tempfile'
+
+
+class Options
+  include Mixlib::CLI
+
+  option :namespace,
+         :short => "-n NAMESPACE",
+         :long => "--namespace NAMESPACE",
+         :description => "Namespace to deploy into.",
+         :required => true
+
+  option :repo_b,
+         :short => "-r",
+         :long => "--repository",
+         :boolean => true,
+         :description => "(bool) Deploy from repositories. default is False",
+         :default => false
+
+  option :package_b,
+         :short => "-p",
+         :long => "--package",
+         :boolean => true,
+         :description => "(bool) Deploy from packaged charts. default is False",
+         :default => false
+
+  option :lint?,
+         :short => "-l",
+         :long => "--lint",
+         :boolean => true,
+         :description => "(bool) (Not Implemented) Lint before installing. default is False",
+         :default => false
+
+  option :overrides_file,
+         :short => "-o FILE",
+         :long => "--override-file FILE",
+         :default => './values.yaml',
+         :description => "defaults to ./values.yaml"
+
+  option :deploy_single_chart,
+         :short => "-c CHARTNAME",
+         :long => "--chart CHARTNAME",
+         :description => "Install a single chart only."
+
+  option :skip,
+         :short => "-s CHARTNAME",
+         :long => "--skip CHARTNAME",
+         :description => "Skip a chart when installing umbrella."
+
+  option :upgrade_single_chart,
+         :short => "-u DEPLOYMENT",
+         :long => "--upgrade DEPLOYMENT",
+         :description => "(Not implemetend)"
+
+  option :output_file,
+         :short => "-O FILE",
+         :long => "--output-file FILE",
+         :description => "optional output to a file."
+
+  option :dry_run,
+         :long => "--dry-run",
+         :boolean => true,
+         :description => "(bool) Dry-run. default is False",
+         :default => false
+
+  option :help,
+         :long => "--help",
+         :short => "-h",
+         :description => "Show this message",
+         :on => :tail,
+         :show_options => true,
+         :boolean => true,
+         :exit => 0
+end
+
+def parse_yaml_file(file_name)
+  begin
+    raise "No file to parse!" unless file_name
+    raise "File Not Found: #{file_name}" unless File.exist?(file_name)
+    YAML.load(File.read(file_name)) or raise "Cannot parse yaml file #{file_name}!"
+
+  rescue => e
+    abort "Parse Error: #{e}"
+  end
+end
+
+def build_overrides_values(options, chart_name)
+  values_h = parse_yaml_file(options.config[:overrides_file])   
+  overrides_values_h = {"global" => values_h["global"]}
+  values_h.each_key do |k|
+    values_to_select = [chart_name]
+    if values_to_select.include?(k)
+      values_h[k].each do |k,v|
+        overrides_values_h[k] = v
+      end
+    end
+  end
+  overrides_values_h
+end
+
+def create_namespace(options)
+  begin
+    namespace = options.config[:namespace]
+    system("kubectl create namespace #{namespace}") 
+
+  rescue => e
+    puts "Namespace creation error: #{e}"
+  end
+end
+
+def write_helm_output_to_file(filename, dir, ret)
+  open("#{dir}/#{filename}", 'a') do |f|
+    f.puts ret
+  end
+end
+
+def create_temp_overrides_file(chart_name, overrides_values_h)
+  #temp_file = Tempfile.open("#{chart_name}", 'overrides/') do |t|
+  temp_file = File.open("overrides/#{chart_name}.yaml", 'w') do |t|
+    t.write(overrides_values_h.to_yaml)
+    t.path
+  end
+end
+
+def construct_cmd(options, temp_overrides_file, repo_url, chart_name, version, namespace)
+  helm_cmd = "helm install -f #{temp_overrides_file}"
+  if options.config[:repo_b]
+    helm_cmd += " #{repo_url}/#{chart_name}-#{version}.tgz"
+  elsif options.config[:package_b]
+    # not working
+    helm_cmd += " #{chart_name}-#{version}.tgz"
+  else
+    helm_cmd += " ../#{chart_name}"
+  end
+  helm_cmd += " --namespace #{namespace}"
+  helm_cmd += " --dry-run --debug" if options.config[:dry_run]
+
+  return helm_cmd
+end
+
+def get_dependencies
+  # helm dep list
+end
+
+def install_chart(chart, options)
+  begin
+    chart_name = chart["name"]
+    version = chart["version"]
+    repo_url = chart["repository"]
+    namespace = options.config[:namespace]
+
+    raise "Error: Chart for #{chart_name} cannot be found!" unless File.exist?("../#{chart_name}") 
+
+    # gather global values and values for individual chart
+    overrides_values_h = build_overrides_values(options, chart_name)
+
+    # drop override values into a uniqe overrides file for each chart
+    temp_overrides_file = create_temp_overrides_file(chart_name, overrides_values_h) 
+
+    # package chart for install if selected for install method
+    build_helm_packages(chart_name) if options.config[:package_b]
+
+    # construct helm command to run, based on cli options
+    helm_cmd = construct_cmd(options, temp_overrides_file, repo_url, chart_name, version, namespace)
+
+    #ret = `echo #{helm_cmd}`
+    ret = `#{helm_cmd}`
+
+  rescue RuntimeError => e
+    puts "Error installing chart: #{e}"
+  end
+end
+
+def build_helm_packages(chart_name)
+  puts "Packaging #{chart_name}"
+  Dir.chdir('charts'){
+    ret = `helm package ../../#{chart_name}/` 
+  }
+end
+
+def get_chart_metadata(options)
+  begin
+    charts_to_install_a = []
+    requirements_h = parse_yaml_file("requirements.yaml")
+
+    if options.config[:deploy_single_chart]
+      chart_name = options.config[:deploy_single_chart]
+      requirements_h["dependencies"].each do |req|
+        if req["name"] == chart_name
+          charts_to_install_a << req
+        else
+          next
+        end
+      end
+    else
+      requirements_h["dependencies"].each do |req|
+        charts_to_install_a << req
+      end
+    end
+    charts_to_install_a
+
+  rescue => e
+    puts "Error getting chart metadata: #{e}"
+  end
+end
+
+def basic_checks(options)
+  begin
+    # create the overrides dir if it does not exist
+    Dir.mkdir("overrides") unless File.exists?("overrides")
+
+    # create charts dir if it does not exist
+    Dir.mkdir("charts") unless File.exists?("charts") if options.config[:package_b]
+    
+    # can't do anything without a requirements.yaml file
+    raise "No 'requirements.yaml' in current directory" unless File.exist?("requirements.yaml")
+
+    # make sure overrides_file exists
+    overrides_file = options.config[:overrides_file]
+    raise "No #{overrides_file} in current directory" unless File.exist?(overrides_file)
+
+  rescue => e
+    puts "Failed basic checks: #{e}"
+    exit(1)
+  end
+end
+
+begin
+  options = Options.new
+  options.parse_options
+
+  puts "helmPlus v.#{version}"
+
+  # run checks
+  basic_checks(options)
+
+  # create namespace, ok to fail
+  create_namespace(options)
+
+  # get metadata for all required charts or single chart
+  chart_list_a = get_chart_metadata(options)
+
+  # list of charts to skip 
+  skip_list_a = [options.config[:skip]] if options.config[:skip] || []
+  skip_list_a = skip_list_a.first.to_s.split(',')
+  puts "Skipping: #{skip_list_a.inspect}" unless skip_list_a.empty?
+
+  # run helm install on each chart in requirements.yaml
+  chart_list_a.each do |chart|
+    if skip_list_a.include?(chart["name"])
+      puts "#{chart["name"]} skipped..." 
+      next
+    end
+    puts "Installing #{chart["name"]}"
+    ret = install_chart(chart, options)
+    write_helm_output_to_file(options.config[:output_file], Dir.pwd, ret) if options.config[:output_file]
+    puts ret # helm output
+  end
+
+rescue NameError,RuntimeError => e
+  puts "General Error: #{e}"
+  exit(1)
+end
